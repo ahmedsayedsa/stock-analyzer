@@ -8,9 +8,9 @@ import yfinance as yf
 import os
 
 app = Flask(__name__)
-CORS(app)  # للسماح لـ n8n بالوصول
+CORS(app)
 
-# قائمة شاملة بأشهر الأسهم في البورصة المصرية مع ISIN
+# قائمة شاملة بأشهر الأسهم في البورصة المصرية
 STOCK_BASE_DATA = {
     # البنوك
     'CIB': {'name': 'البنك التجاري الدولي', 'base_price': 103.01, 'sector': 'Banking', 'isin': 'EGS60121C018', 'mubasher_id': 'COMI'},
@@ -119,7 +119,7 @@ price_source = {}
 CACHE_DURATION = 300  # 5 دقائق
 
 def get_live_price_egxpy(ticker):
-    """جلب السعر من EGXPY"""
+    """جلب السعر من EGXPY (محسّن)"""
     try:
         from egxpy.download import get_EGXdata
         
@@ -138,17 +138,20 @@ def get_live_price_egxpy(ticker):
                     price = float(price_data.iloc[-1])
                 
                 if price > 0:
+                    print(f"✅ EGXPY: {price} EGP")
                     return price
         
         return None
         
     except ImportError:
+        print(f"⚠️ EGXPY not installed")
         return None
     except Exception as e:
+        print(f"❌ EGXPY error: {str(e)}")
         return None
 
 def get_live_price_yahoo(ticker):
-    """جلب السعر من Yahoo Finance"""
+    """جلب السعر من Yahoo Finance (محسّن ومعدّل)"""
     try:
         stock_info = STOCK_BASE_DATA.get(ticker)
         if not stock_info:
@@ -156,44 +159,53 @@ def get_live_price_yahoo(ticker):
         
         base_price = stock_info['base_price']
         
+        # محاولات متعددة مع ticker symbols مختلفة
         attempts = [
-            f"{stock_info.get('mubasher_id', ticker)}.CA",
-            f"{ticker}.CA",
-            f"{stock_info['isin']}.CA"
+            f"{stock_info.get('mubasher_id', ticker)}.CA",  # COMI.CA
+            f"{ticker}.CA",                                  # CIB.CA
         ]
         
         for yahoo_ticker in attempts:
             try:
                 stock = yf.Ticker(yahoo_ticker)
                 
+                # جرب من history الأول (أدق)
                 hist = stock.history(period='5d')
-                if not hist.empty:
+                if not hist.empty and len(hist) > 0:
                     price = float(hist['Close'].iloc[-1])
                     
-                    if base_price * 0.4 <= price <= base_price * 1.6:
+                    # Validation أوسع: ±70% من base price
+                    if price > 0 and base_price * 0.3 <= price <= base_price * 2.0:
+                        print(f"✅ Yahoo ({yahoo_ticker}): {price} EGP")
                         return price
                     else:
+                        print(f"⚠️ {yahoo_ticker}: Price {price} out of range (expected ~{base_price})")
                         continue
                 
+                # جرب من info (backup)
                 info = stock.info
                 price = (info.get('currentPrice') or 
                         info.get('regularMarketPrice') or 
                         info.get('previousClose'))
                 
                 if price and price > 0:
-                    if base_price * 0.4 <= price <= base_price * 1.6:
+                    # Validation
+                    if base_price * 0.3 <= price <= base_price * 2.0:
+                        print(f"✅ Yahoo info ({yahoo_ticker}): {price} EGP")
                         return price
                         
             except Exception as e:
+                print(f"⚠️ Yahoo attempt {yahoo_ticker} failed: {str(e)}")
                 continue
         
         return None
         
     except Exception as e:
+        print(f"❌ Yahoo error: {str(e)}")
         return None
 
 def get_live_price(ticker):
-    """جلب السعر من مصادر متعددة"""
+    """جلب السعر من مصادر متعددة (Hybrid)"""
     global price_cache, cache_timestamp, price_source
     
     # تحقق من الـ cache
@@ -205,26 +217,30 @@ def get_live_price(ticker):
     price = None
     source = None
     
-    # جرب EGXPY
+    # 1. جرب EGXPY الأول
+    print(f"🔍 Fetching {ticker}... [1] EGXPY... ", end='')
     price = get_live_price_egxpy(ticker)
     if price:
         source = 'EGXPY'
     
-    # جرب Yahoo Finance
+    # 2. لو فشل، جرب Yahoo Finance
     if not price:
+        print(f"[2] Yahoo... ", end='')
         price = get_live_price_yahoo(ticker)
         if price:
             source = 'Yahoo Finance'
     
-    # احفظ في cache
+    # 3. احفظ في cache لو نجح
     if price:
         price_cache[ticker] = price
         cache_timestamp[ticker] = datetime.now()
         price_source[ticker] = source
-        STOCK_BASE_DATA[ticker]['base_price'] = price
+        STOCK_BASE_DATA[ticker]['base_price'] = price  # تحديث base price
+        print(f"✅")
         return price
     
-    # استخدم base price
+    # 4. استخدم base price كـ fallback
+    print(f"⚠️ Using base price")
     source = 'Base Price (Fallback)'
     price = STOCK_BASE_DATA[ticker]['base_price']
     price_source[ticker] = source
@@ -235,7 +251,7 @@ def get_current_price(ticker):
     return get_live_price(ticker)
 
 def generate_realistic_stock_data(ticker, days=365):
-    """توليد بيانات تاريخية"""
+    """توليد بيانات تاريخية بناءً على السعر الحقيقي"""
     current_price = get_live_price(ticker)
     
     dates = pd.date_range(end=datetime.now(), periods=days, freq='D')
@@ -263,6 +279,65 @@ def generate_realistic_stock_data(ticker, days=365):
     
     return df
 
+def calculate_technical_indicators(data):
+    """حساب المؤشرات الفنية"""
+    current_price = float(data['Close'].iloc[-1])
+    prev_close = float(data['Close'].iloc[-2])
+    daily_change = ((current_price - prev_close) / prev_close) * 100
+    
+    # Moving Averages
+    ma_20 = float(data['Close'].tail(20).mean()) if len(data) >= 20 else None
+    ma_50 = float(data['Close'].tail(50).mean()) if len(data) >= 50 else None
+    ma_200 = float(data['Close'].tail(200).mean()) if len(data) >= 200 else None
+    
+    # RSI
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+    rs = gain / loss
+    rsi_value = rs.iloc[-1]
+    rsi = float(100 - (100 / (1 + rsi_value))) if rsi_value > 0 and not pd.isna(rsi_value) else 50.0
+    
+    # MACD
+    ema_12 = data['Close'].ewm(span=12, adjust=False).mean()
+    ema_26 = data['Close'].ewm(span=26, adjust=False).mean()
+    macd = float(ema_12.iloc[-1] - ema_26.iloc[-1])
+    signal_line = float((ema_12 - ema_26).ewm(span=9, adjust=False).mean().iloc[-1])
+    
+    # Trend
+    trend = 'Bullish' if ma_50 and current_price > ma_50 else 'Bearish' if ma_50 else 'Neutral'
+    
+    # Recommendation
+    signals = []
+    if rsi < 30:
+        signals.append('oversold')
+    if rsi > 70:
+        signals.append('overbought')
+    if macd > signal_line:
+        signals.append('bullish_macd')
+    if trend == 'Bullish':
+        signals.append('bullish_trend')
+    
+    if 'oversold' in signals or (len(signals) >= 2 and 'bullish_macd' in signals and 'bullish_trend' in signals):
+        recommendation = 'BUY'
+    elif 'overbought' in signals:
+        recommendation = 'SELL'
+    else:
+        recommendation = 'HOLD'
+    
+    return {
+        'current_price': current_price,
+        'daily_change': daily_change,
+        'ma_20': ma_20,
+        'ma_50': ma_50,
+        'ma_200': ma_200,
+        'rsi': rsi,
+        'macd': macd,
+        'signal_line': signal_line,
+        'trend': trend,
+        'recommendation': recommendation
+    }
+
 # ================ API ENDPOINTS ================
 
 @app.route('/', methods=['GET'])
@@ -273,17 +348,27 @@ def home():
         'version': '5.0 - Production',
         'total_stocks': len(STOCK_BASE_DATA),
         'mode': 'LIVE - Multi-Source Hybrid',
-        'data_sources': ['EGXPY', 'Yahoo Finance', 'Base Prices'],
+        'data_sources': {
+            'primary': 'EGXPY (Egyptian Exchange specialist)',
+            'secondary': 'Yahoo Finance',
+            'fallback': 'Base prices'
+        },
         'cache_duration': f'{CACHE_DURATION}s',
         'endpoints': {
-            '/api/stock/<ticker>': 'Stock analysis',
-            '/api/prices': 'All prices',
+            '/': 'API Info',
+            '/health': 'Health check',
+            '/api/stock/<ticker>': 'Stock analysis (GET)',
+            '/api/prices': 'All prices (GET)',
             '/api/compare': 'Compare stocks (POST)',
-            '/api/refresh/<ticker>': 'Refresh price',
-            '/api/sectors': 'Group by sectors',
-            '/api/available': 'Available tickers',
-            '/api/search?q=name': 'Search stocks',
-            '/health': 'Health check'
+            '/api/refresh/<ticker>': 'Refresh price (GET)',
+            '/api/sectors': 'Group by sectors (GET)',
+            '/api/available': 'Available tickers (GET)',
+            '/api/search?q=name': 'Search stocks (GET)'
+        },
+        'examples': {
+            'stock_analysis': '/api/stock/CIB',
+            'compare_stocks': 'POST /api/compare {"tickers": ["CIB", "PHDC"]}',
+            'search': '/api/search?q=بنك'
         }
     })
 
@@ -295,51 +380,33 @@ def health():
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'uptime': 'running',
         'stocks_loaded': len(STOCK_BASE_DATA),
-        'cache_size': len(price_cache)
+        'cache_size': len(price_cache),
+        'version': '5.0'
     }), 200
 
 @app.route('/api/stock/<ticker>', methods=['GET'])
 def analyze_stock(ticker):
-    """تحليل فني كامل"""
+    """تحليل فني كامل لسهم"""
     try:
         ticker = ticker.upper()
         
         if ticker not in STOCK_BASE_DATA:
             return jsonify({
                 'success': False,
-                'error': f'Ticker {ticker} not found'
+                'error': f'Ticker {ticker} not found',
+                'available_count': len(STOCK_BASE_DATA),
+                'tip': 'Use /api/available to see all tickers'
             }), 404
         
         days = int(request.args.get('days', 365))
         if days > 1095:
             days = 1095
         
+        # جلب البيانات
         data = generate_realistic_stock_data(ticker, days)
         
-        current_price = float(data['Close'].iloc[-1])
-        prev_close = float(data['Close'].iloc[-2])
-        daily_change = ((current_price - prev_close) / prev_close) * 100
-        
-        # المؤشرات الفنية
-        ma_20 = float(data['Close'].tail(20).mean()) if len(data) >= 20 else None
-        ma_50 = float(data['Close'].tail(50).mean()) if len(data) >= 50 else None
-        ma_200 = float(data['Close'].tail(200).mean()) if len(data) >= 200 else None
-        
-        # RSI
-        delta = data['Close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-        loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
-        rs = gain / loss
-        rsi_value = rs.iloc[-1]
-        rsi = float(100 - (100 / (1 + rsi_value))) if rsi_value > 0 and not pd.isna(rsi_value) else 50.0
-        
-        # MACD
-        ema_12 = data['Close'].ewm(span=12, adjust=False).mean()
-        ema_26 = data['Close'].ewm(span=26, adjust=False).mean()
-        macd = float(ema_12.iloc[-1] - ema_26.iloc[-1])
-        signal_line = float((ema_12 - ema_26).ewm(span=9, adjust=False).mean().iloc[-1])
-        
-        trend = 'Bullish' if ma_50 and current_price > ma_50 else 'Bearish' if ma_50 else 'Neutral'
+        # حساب المؤشرات
+        indicators = calculate_technical_indicators(data)
         
         stock_info = STOCK_BASE_DATA[ticker]
         
@@ -354,8 +421,8 @@ def analyze_stock(ticker):
             'price_cached': ticker in price_cache,
             'last_price_update': cache_timestamp[ticker].strftime('%Y-%m-%d %H:%M:%S') if ticker in cache_timestamp else 'Just fetched',
             'price_data': {
-                'current_price': round(current_price, 2),
-                'daily_change_percent': round(daily_change, 2),
+                'current_price': round(indicators['current_price'], 2),
+                'daily_change_percent': round(indicators['daily_change'], 2),
                 'period_high': round(float(data['High'].max()), 2),
                 'period_low': round(float(data['Low'].min()), 2),
                 'open': round(float(data['Open'].iloc[-1]), 2),
@@ -365,36 +432,56 @@ def analyze_stock(ticker):
             },
             'technical_indicators': {
                 'rsi': {
-                    'value': round(rsi, 2),
-                    'signal': 'Overbought' if rsi > 70 else 'Oversold' if rsi < 30 else 'Neutral'
+                    'value': round(indicators['rsi'], 2),
+                    'signal': 'Overbought' if indicators['rsi'] > 70 else 'Oversold' if indicators['rsi'] < 30 else 'Neutral',
+                    'description': 'Relative Strength Index (14-day)'
                 },
                 'moving_averages': {
-                    'ma_20': round(ma_20, 2) if ma_20 else None,
-                    'ma_50': round(ma_50, 2) if ma_50 else None,
-                    'ma_200': round(ma_200, 2) if ma_200 else None,
-                    'trend': trend
+                    'ma_20': round(indicators['ma_20'], 2) if indicators['ma_20'] else None,
+                    'ma_50': round(indicators['ma_50'], 2) if indicators['ma_50'] else None,
+                    'ma_200': round(indicators['ma_200'], 2) if indicators['ma_200'] else None,
+                    'trend': indicators['trend'],
+                    'description': 'Price vs MA-50 trend'
                 },
                 'macd': {
-                    'value': round(macd, 4),
-                    'signal': round(signal_line, 4),
-                    'histogram': round(macd - signal_line, 4),
-                    'signal_text': 'Bullish' if macd > signal_line else 'Bearish'
+                    'value': round(indicators['macd'], 4),
+                    'signal': round(indicators['signal_line'], 4),
+                    'histogram': round(indicators['macd'] - indicators['signal_line'], 4),
+                    'signal_text': 'Bullish' if indicators['macd'] > indicators['signal_line'] else 'Bearish',
+                    'description': 'MACD (12,26,9)'
                 }
+            },
+            'recommendation': {
+                'action': indicators['recommendation'],
+                'description': f"Based on RSI, MACD, and trend analysis"
+            },
+            'volume_analysis': {
+                'current': int(data['Volume'].iloc[-1]),
+                'average': int(data['Volume'].mean()),
+                'ratio_percent': round((int(data['Volume'].iloc[-1]) / int(data['Volume'].mean())) * 100, 2)
             }
         })
         
     except Exception as e:
+        import traceback
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }), 500
 
 @app.route('/api/prices', methods=['GET'])
 def current_prices():
-    """الأسعار الحالية"""
+    """الأسعار الحالية لكل الأسهم"""
+    sector_filter = request.args.get('sector', None)
+    
     prices = {}
     
     for ticker, data in STOCK_BASE_DATA.items():
+        # Filter بالـ sector لو موجود
+        if sector_filter and data['sector'].lower() != sector_filter.lower():
+            continue
+            
         current = get_current_price(ticker)
         
         prices[ticker] = {
@@ -403,12 +490,14 @@ def current_prices():
             'price': round(current, 2),
             'currency': 'EGP',
             'source': price_source.get(ticker, 'Not fetched yet'),
-            'cached': ticker in price_cache
+            'cached': ticker in price_cache,
+            'last_updated': cache_timestamp[ticker].strftime('%H:%M:%S') if ticker in cache_timestamp else 'Not fetched'
         }
     
     return jsonify({
         'success': True,
         'total': len(prices),
+        'sector_filter': sector_filter,
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'prices': prices
     })
@@ -417,6 +506,14 @@ def current_prices():
 def compare_stocks():
     """مقارنة بين أسهم متعددة"""
     data = request.get_json()
+    
+    if not data:
+        return jsonify({
+            'success': False,
+            'error': 'No JSON data provided',
+            'example': {'tickers': ['CIB', 'PHDC', 'SWDY']}
+        }), 400
+    
     tickers = data.get('tickers', [])
     
     if not tickers or len(tickers) < 2:
@@ -435,11 +532,19 @@ def compare_stocks():
         stock_info = STOCK_BASE_DATA[ticker]
         current_price = get_current_price(ticker)
         
+        # حساب مؤشرات بسيطة
+        stock_data = generate_realistic_stock_data(ticker, 90)
+        indicators = calculate_technical_indicators(stock_data)
+        
         comparison.append({
             'ticker': ticker,
             'name': stock_info['name'],
             'sector': stock_info['sector'],
             'price': round(current_price, 2),
+            'daily_change': round(indicators['daily_change'], 2),
+            'rsi': round(indicators['rsi'], 2),
+            'trend': indicators['trend'],
+            'recommendation': indicators['recommendation'],
             'source': price_source.get(ticker, 'Unknown')
         })
     
@@ -456,8 +561,12 @@ def refresh_price(ticker):
     ticker = ticker.upper()
     
     if ticker not in STOCK_BASE_DATA:
-        return jsonify({'success': False, 'error': f'Ticker {ticker} not found'}), 404
+        return jsonify({
+            'success': False,
+            'error': f'Ticker {ticker} not found'
+        }), 404
     
+    # احذف من الـ cache
     if ticker in price_cache:
         del price_cache[ticker]
     if ticker in cache_timestamp:
@@ -465,6 +574,7 @@ def refresh_price(ticker):
     if ticker in price_source:
         del price_source[ticker]
     
+    # جلب السعر الجديد
     new_price = get_live_price(ticker)
     
     return jsonify({
@@ -472,7 +582,8 @@ def refresh_price(ticker):
         'ticker': ticker,
         'price': round(new_price, 2),
         'source': price_source.get(ticker, 'Unknown'),
-        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'cached': False
     })
 
 @app.route('/api/sectors', methods=['GET'])
@@ -486,13 +597,15 @@ def get_sectors():
         sectors[sector].append({
             'ticker': ticker,
             'name': data['name'],
-            'price': round(get_current_price(ticker), 2)
+            'price': round(get_current_price(ticker), 2),
+            'isin': data.get('isin', 'N/A')
         })
     
     return jsonify({
         'success': True,
         'total_sectors': len(sectors),
-        'sectors': sectors
+        'sectors': sectors,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     })
 
 @app.route('/api/search', methods=['GET'])
@@ -503,7 +616,8 @@ def search_stocks():
     if not query:
         return jsonify({
             'success': False,
-            'error': 'Please provide search query (?q=...)'
+            'error': 'Please provide search query (?q=...)',
+            'example': '/api/search?q=بنك'
         }), 400
     
     results = []
@@ -515,7 +629,8 @@ def search_stocks():
                 'ticker': ticker,
                 'name': data['name'],
                 'sector': data['sector'],
-                'price': round(get_current_price(ticker), 2)
+                'price': round(get_current_price(ticker), 2),
+                'isin': data.get('isin', 'N/A')
             })
     
     return jsonify({
@@ -527,18 +642,29 @@ def search_stocks():
 
 @app.route('/api/available', methods=['GET'])
 def available_tickers():
-    """قائمة كل الأسهم"""
+    """قائمة كل الأسهم المتاحة"""
     return jsonify({
         'success': True,
         'total': len(STOCK_BASE_DATA),
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'tickers': [{
             'symbol': symbol,
             'name': data['name'],
             'sector': data['sector'],
+            'isin': data.get('isin', 'N/A'),
             'currency': 'EGP'
         } for symbol, data in STOCK_BASE_DATA.items()]
     })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    print("=" * 70)
+    print("🚀 Egyptian Stock Analyzer API - Production v5.0")
+    print("=" * 70)
+    print(f"📊 Total Stocks: {len(STOCK_BASE_DATA)}")
+    print(f"🔴 Mode: LIVE - Multi-Source Hybrid")
+    print(f"📡 Data Sources: EGXPY → Yahoo Finance → Base Prices")
+    print(f"💾 Cache Duration: {CACHE_DURATION}s")
+    print(f"🌐 Port: {port}")
+    print("=" * 70)
     app.run(host='0.0.0.0', port=port, debug=False)
