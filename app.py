@@ -1,474 +1,442 @@
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+# app.py
+# EGX multi-source price API with technical indicators
+# Sources: yfinance (.CA), egxpy, Mubasher scraping
+# Cache: configurable via env (default 300s)
+# Endpoints: /api/stock/{ticker}, /api/prices, /api/test-sources/{ticker}, /health
+
+import os
+import time
+import json
+import logging
+import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import time
 import yfinance as yf
-import os
-import requests
 from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Dict, Tuple, Optional
 
-app = Flask(__name__)
-CORS(app)
+# -----------------------------
+# Config & logging
+# -----------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("egx-api")
 
-# قائمة الأسهم المصرية
-STOCK_BASE_DATA = {
-    # البنوك
-    'CIB': {'name': 'البنك التجاري الدولي', 'base_price': 103.01, 'sector': 'Banking', 'isin': 'EGS60121C018', 'mubasher_id': 'COMI', 'yahoo_symbol': 'COMI.CA'},
-    'COMI': {'name': 'المصرف المتحد', 'base_price': 14.59, 'sector': 'Banking', 'isin': 'EGS60131C016', 'mubasher_id': 'COMI', 'yahoo_symbol': 'COMI.CA'},
-    'HDBK': {'name': 'بنك التعمير والإسكان', 'base_price': 88.86, 'sector': 'Banking', 'isin': 'EGS60041C011', 'mubasher_id': 'HDBK', 'yahoo_symbol': 'HDBK.CA'},
-    'QNBA': {'name': 'بنك قطر الوطني الأهلي', 'base_price': 56.00, 'sector': 'Banking', 'isin': 'EGS60061C017', 'mubasher_id': 'QNBK', 'yahoo_symbol': 'QNBK.CA'},
-    'CIEB': {'name': 'كريدي أجريكول', 'base_price': 127.00, 'sector': 'Banking', 'isin': 'EGS60151C014', 'mubasher_id': 'CIEB', 'yahoo_symbol': 'CIEB.CA'},
-    
-    # العقارات
-    'PHDC': {'name': 'بالم هيلز للتعمير', 'base_price': 37.56, 'sector': 'Real Estate', 'isin': 'EGS673L1C015', 'mubasher_id': 'PHDC', 'yahoo_symbol': 'PHDC.CA'},
-    'OCDI': {'name': 'أوراسكوم للتنمية', 'base_price': 88.02, 'sector': 'Real Estate', 'isin': 'EGS383S1C011', 'mubasher_id': 'OCDI', 'yahoo_symbol': 'OCDI.CA'},
-    'TMGH': {'name': 'طلعت مصطفى القابضة', 'base_price': 45.00, 'sector': 'Real Estate', 'isin': 'EGS65401C011', 'mubasher_id': 'TMGH', 'yahoo_symbol': 'TMGH.CA'},
-    
-    # الصناعة
-    'SWDY': {'name': 'السويدي إليكتريك', 'base_price': 45.00, 'sector': 'Industrial', 'isin': 'EGS65451C019', 'mubasher_id': 'SWDY', 'yahoo_symbol': 'SWDY.CA'},
-    'ORAS': {'name': 'أوراسكوم كونستراكشون', 'base_price': 380.00, 'sector': 'Industrial', 'isin': 'EGS383S1C011', 'mubasher_id': 'ORAS', 'yahoo_symbol': 'ORAS.CA'},
-    
-    # الأغذية
-    'JUFO': {'name': 'جهينة للصناعات الغذائية', 'base_price': 5.80, 'sector': 'Food & Beverage', 'isin': 'EGS65611C015', 'mubasher_id': 'JUFO', 'yahoo_symbol': 'JUFO.CA'},
-    'EAST': {'name': 'الشرقية ايسترن كومباني', 'base_price': 52.00, 'sector': 'Food & Beverage', 'isin': 'EGS60181C016', 'mubasher_id': 'EAST', 'yahoo_symbol': 'EAST.CA'},
-    
-    # الأدوية
-    'PHAR': {'name': 'الإسكندرية للأدوية', 'base_price': 28.00, 'sector': 'Healthcare', 'isin': 'EGS60282C012', 'mubasher_id': 'PHAR', 'yahoo_symbol': 'PHAR.CA'},
-    
-    # الاتصالات
-    'ETEL': {'name': 'المصرية للاتصالات', 'base_price': 19.50, 'sector': 'Telecommunications', 'isin': 'EGS68101C013', 'mubasher_id': 'ETEL', 'yahoo_symbol': 'ETEL.CA'},
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+DEFAULT_HISTORY_DAYS = int(os.getenv("DEFAULT_HISTORY_DAYS", "420"))
+SYNTHETIC_POINTS = int(os.getenv("SYNTHETIC_POINTS", "300"))
+MUBASHER_TIMEOUT = int(os.getenv("MUBASHER_TIMEOUT", "10"))
+REASONABLE_LOW = float(os.getenv("REASONABLE_LOW", "0.5"))
+REASONABLE_HIGH = float(os.getenv("REASONABLE_HIGH", "1.5"))
+
+# -----------------------------
+# In-memory cache and mappings
+# -----------------------------
+price_cache: Dict[str, Dict] = {}
+
+TICKER_MAP = {
+    "CIB": "COMI.CA",
+    "COMI": "COMI.CA",
+    "FWRY": "FWRY.CA",
+    "PHDC": "PHDC.CA",
+    "ETEL": "ETEL.CA",
+    "ORHD": "ORHD.CA",
+    "HRHO": "HRHO.CA",
+    "AMOC": "AMOC.CA",
+    "TALA": "TALA.CA",
+    "MNHD": "MNHD.CA",
+    "EKHO": "EKHO.CA",
+    "SWDY": "SWDY.CA",
+    "CLHO": "CLHO.CA",
+    "EMFD": "EMFD.CA",
+    "JUFO": "JUFO.CA",
+    "OCIC": "OCIC.CA",
+    "EFID": "EFID.CA",
+    "EGTS": "EGTS.CA",
 }
 
-# Cache
-price_cache = {}
-cache_timestamp = {}
-price_source = {}
-CACHE_DURATION = 300  # 5 دقائق
+SYMBOL_META = {
+    "COMI": {"name": "Commercial International Bank", "sector": "Banks"},
+    "FWRY": {"name": "Fawry for Banking Technology", "sector": "IT Services"},
+    "PHDC": {"name": "Palm Hills Developments", "sector": "Real Estate"},
+    "ETEL": {"name": "Telecom Egypt", "sector": "Telecom"},
+    "ORHD": {"name": "Orascom Development Egypt", "sector": "Real Estate"},
+    "HRHO": {"name": "EFG Hermes", "sector": "Financial Services"},
+    "AMOC": {"name": "AMOC", "sector": "Energy"},
+    "TALA": {"name": "Talaat Moustafa Group", "sector": "Real Estate"},
+    "MNHD": {"name": "Madinet Nasr Housing", "sector": "Real Estate"},
+    "EKHO": {"name": "EKHO", "sector": "Investment"},
+    "SWDY": {"name": "Elsewedy Electric", "sector": "Industrial"},
+    "CLHO": {"name": "Cleopatra Hospital", "sector": "Healthcare"},
+    "EMFD": {"name": "Emaar Misr", "sector": "Real Estate"},
+    "JUFO": {"name": "Juhayna Food Industries", "sector": "Food & Beverage"},
+    "OCIC": {"name": "Orascom Construction", "sector": "Industrial"},
+    "EFID": {"name": "Edita Food Industries", "sector": "Food & Beverage"},
+    "EGTS": {"name": "Egyptian Resorts Company", "sector": "Tourism"},
+}
 
-# ==================== METHOD 1: yfinance (Yahoo Finance) ====================
-def get_price_yfinance(ticker):
-    """الطريقة 1: yfinance مع .CA suffix"""
+BASE_PRICES = {
+    "COMI": 60.0,
+    "FWRY": 10.0,
+    "PHDC": 2.0,
+    "ETEL": 20.0,
+    "HRHO": 15.0,
+    "AMOC": 5.0,
+    "TALA": 15.0,
+    "MNHD": 6.0,
+    "EKHO": 1.2,
+    "SWDY": 45.0,
+    "CLHO": 5.0,
+    "EMFD": 4.0,
+    "JUFO": 10.0,
+    "OCIC": 120.0,
+    "EFID": 20.0,
+    "EGTS": 1.5,
+}
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def normalize_ticker(t: str) -> str:
+    return t.strip().upper()
+
+def is_reasonable_price(ticker: str, price: float) -> bool:
+    base = BASE_PRICES.get(normalize_ticker(ticker))
+    if base is None:
+        return True
+    return (REASONABLE_LOW * base) <= price <= (REASONABLE_HIGH * base)
+
+def yahoo_symbol(ticker: str) -> Optional[str]:
+    return TICKER_MAP.get(normalize_ticker(ticker))
+
+# -----------------------------
+# Source 1: yfinance
+# -----------------------------
+def fetch_price_yfinance(ticker: str) -> Tuple[Optional[float], str]:
+    yf_ticker = yahoo_symbol(ticker)
+    if not yf_ticker:
+        return None, "yfinance: ticker unmapped"
     try:
-        stock_info = STOCK_BASE_DATA.get(ticker)
-        if not stock_info:
-            return None
-        
-        yahoo_symbol = stock_info.get('yahoo_symbol', f"{ticker}.CA")
-        
-        # جرب download (أسرع)
-        stock = yf.Ticker(yahoo_symbol)
-        hist = stock.history(period='1d')
-        
+        stock = yf.Ticker(yf_ticker)
+        # Try fast info first
+        info = getattr(stock, "fast_info", None)
+        price = None
+        if info and getattr(info, "last_price", None):
+            price = float(info.last_price)
+        else:
+            info_dict = stock.info or {}
+            price = info_dict.get("regularMarketPrice") or info_dict.get("previousClose")
+
+        if price and is_reasonable_price(ticker, float(price)):
+            return float(price), "yfinance"
+
+        hist = stock.history(period="5d", interval="1d")
         if not hist.empty:
-            price = float(hist['Close'].iloc[-1])
-            if price > 0:
-                print(f"✅ yfinance ({yahoo_symbol}): {price} EGP")
-                return {'price': price, 'source': 'Yahoo Finance', 'method': 'yfinance'}
-        
-        return None
-        
+            last_close = float(hist["Close"].iloc[-1])
+            if is_reasonable_price(ticker, last_close):
+                return last_close, "yfinance(hist)"
+        return None, "yfinance: no valid price"
     except Exception as e:
-        print(f"❌ yfinance error: {str(e)}")
+        logger.warning(f"[yfinance] {ticker} error: {e}")
+        return None, f"yfinance error: {e}"
+
+def fetch_history_yfinance(ticker: str, days: int = DEFAULT_HISTORY_DAYS) -> Optional[pd.DataFrame]:
+    yf_ticker = yahoo_symbol(ticker)
+    if not yf_ticker:
+        return None
+    try:
+        df = yf.download(yf_ticker, period=f"{days}d", interval="1d")
+        if not df.empty:
+            df = df.rename(columns=str.lower)
+            return df
+    except Exception as e:
+        logger.warning(f"[yfinance history] {ticker} error: {e}")
+        return None
+    return None
+
+# -----------------------------
+# Source 2: egxpy
+# -----------------------------
+def fetch_price_egxpy(ticker: str) -> Tuple[Optional[float], str]:
+    try:
+        import egxpy.download as egx_dl
+        end = pd.Timestamp.today().strftime("%Y-%m-%d")
+        start = (pd.Timestamp.today() - pd.Timedelta(days=70)).strftime("%Y-%m-%d")
+        df = egx_dl.get_OHLCV_data(normalize_ticker(ticker), start, end)
+        if df is not None and not df.empty:
+            close_col = "close" if "close" in df.columns else df.columns[-1]
+            price = float(df[close_col].iloc[-1])
+            if is_reasonable_price(ticker, price):
+                return price, "egxpy"
+            return None, "egxpy: unreasonable"
+        return None, "egxpy: empty"
+    except ImportError as e:
+        logger.warning(f"[egxpy] import error: {e}")
+        return None, f"egxpy import error: {e}"
+    except Exception as e:
+        logger.warning(f"[egxpy] {ticker} error: {e}")
+        return None, f"egxpy error: {e}"
+
+def fetch_history_egxpy(ticker: str, start: str = "2025-01-01", end: str = None) -> Optional[pd.DataFrame]:
+    try:
+        import egxpy.download as egx_dl
+        if end is None:
+            end = pd.Timestamp.today().strftime("%Y-%m-%d")
+        df = egx_dl.get_OHLCV_data(normalize_ticker(ticker), start, end)
+        if df is not None and not df.empty:
+            return df.rename(columns=str.lower)
+        return None
+    except Exception as e:
+        logger.warning(f"[egxpy history] {ticker} error: {e}")
         return None
 
-# ==================== METHOD 2: egxpy ====================
-def get_price_egxpy(ticker):
-    """الطريقة 2: egxpy - المكتبة المتخصصة"""
+# -----------------------------
+# Source 3: Web scraping (Mubasher)
+# -----------------------------
+def fetch_price_mubasher(ticker: str) -> Tuple[Optional[float], str]:
     try:
-        from egxpy.download import get_EGXdata
-        
-        # استخدام ticker المحلي بدون suffix
-        data = get_EGXdata([ticker], interval='1D', period='5d')
-        
-        if data is not None and not data.empty:
-            if ticker in data.columns or ticker in data:
-                price_data = data[ticker] if ticker in data else data
-                
-                if isinstance(price_data, pd.DataFrame):
-                    price = float(price_data['Close'].iloc[-1]) if 'Close' in price_data.columns else float(price_data.iloc[-1].values[0])
-                else:
-                    price = float(price_data.iloc[-1])
-                
-                if price > 0:
-                    print(f"✅ egxpy: {price} EGP")
-                    return {'price': price, 'source': 'EGXPY', 'method': 'egxpy'}
-        
-        return None
-        
-    except ImportError:
-        print(f"⚠️ egxpy not installed")
-        return None
-    except Exception as e:
-        print(f"❌ egxpy error: {str(e)}")
-        return None
-
-# ==================== METHOD 3: Web Scraping - Mubasher ====================
-def get_price_mubasher(ticker):
-    """الطريقة 3: Web Scraping من Mubasher"""
-    try:
-        stock_info = STOCK_BASE_DATA.get(ticker)
-        if not stock_info:
-            return None
-        
-        mubasher_id = stock_info.get('mubasher_id', ticker)
-        url = f"https://english.mubasher.info/markets/EGX/stocks/{mubasher_id}"
-        
+        url = f"https://english.mubasher.info/markets/EGX/stocks/{normalize_ticker(ticker)}"
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Connection': 'keep-alive',
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
         }
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # جرب selectors مختلفة
-            price_selectors = [
-                {'class': 'last-price'},
-                {'class': 'lastPrice'},
-                {'class': 'price'},
-                {'data-field': 'lastPrice'},
-            ]
-            
-            for selector in price_selectors:
-                price_element = soup.find(class_=selector.get('class')) if 'class' in selector else soup.find(attrs=selector)
-                
-                if price_element:
-                    price_text = price_element.get_text().strip()
-                    # Clean the price
-                    price_text = price_text.replace(',', '').replace('EGP', '').replace('ج.م', '').strip()
-                    
-                    try:
-                        price = float(price_text)
-                        if price > 0:
-                            print(f"✅ Mubasher scraping: {price} EGP")
-                            return {'price': price, 'source': 'Mubasher (Scraped)', 'method': 'scraping'}
-                    except ValueError:
-                        continue
-        
-        return None
-        
+        r = requests.get(url, headers=headers, timeout=MUBASHER_TIMEOUT)
+        if r.status_code != 200:
+            return None, f"mubasher http {r.status_code}"
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        selectors = [
+            ".last-price .value",
+            ".stock-last-price",
+            ".instrument-last-price",
+            ".last-price-value",
+            "span.price-value",
+        ]
+        price_text = None
+        for sel in selectors:
+            tag = soup.select_one(sel)
+            if tag and tag.text:
+                price_text = tag.text.strip()
+                break
+
+        if not price_text:
+            import re
+            m = re.search(r"(?i)(Last\s*Price|Price)\D*(\d+[\.,]?\d*)", r.text)
+            if m:
+                price_text = m.group(2)
+
+        if not price_text:
+            return None, "mubasher: selector not found"
+
+        price_text = price_text.replace(",", "").replace("EGP", "").replace("ج.م", "").strip()
+        price = float(price_text)
+        if is_reasonable_price(ticker, price):
+            return price, "mubasher"
+        return None, "mubasher: unreasonable"
     except Exception as e:
-        print(f"❌ Mubasher scraping error: {str(e)}")
-        return None
+        logger.warning(f"[mubasher] {ticker} error: {e}")
+        return None, f"mubasher error: {e}"
 
-# ==================== HYBRID: Multi-Source Price Fetcher ====================
-def get_live_price(ticker):
-    """
-    Multi-Source Hybrid Price Fetcher
-    الأولوية: yfinance → egxpy → Mubasher Scraping → Base Price
-    """
-    global price_cache, cache_timestamp, price_source
-    
-    # 1. Check cache first
-    if ticker in price_cache and ticker in cache_timestamp:
-        time_diff = (datetime.now() - cache_timestamp[ticker]).seconds
-        if time_diff < CACHE_DURATION:
-            return price_cache[ticker]
-    
-    print(f"\n🔍 Fetching {ticker}...")
-    
-    result = None
-    
-    # 2. Try yfinance (Most stable)
-    print(f"  [1/3] Trying yfinance... ", end='')
-    result = get_price_yfinance(ticker)
-    
-    # 3. Try egxpy (EGX specialist)
-    if not result:
-        print(f"  [2/3] Trying egxpy... ", end='')
-        result = get_price_egxpy(ticker)
-    
-    # 4. Try Mubasher scraping (Live data)
-    if not result:
-        print(f"  [3/3] Trying Mubasher scraping... ", end='')
-        result = get_price_mubasher(ticker)
-        time.sleep(1)  # Rate limiting
-    
-    # 5. Save to cache if successful
-    if result and result.get('price'):
-        price = result['price']
-        source = result['source']
-        
-        price_cache[ticker] = price
-        cache_timestamp[ticker] = datetime.now()
-        price_source[ticker] = source
-        STOCK_BASE_DATA[ticker]['base_price'] = price
-        
-        print(f"✅ Success!")
-        return price
-    
-    # 6. Fallback to base price
-    print(f"⚠️ All methods failed, using base price")
-    price = STOCK_BASE_DATA[ticker]['base_price']
-    price_source[ticker] = 'Base Price (Fallback)'
-    return price
+# -----------------------------
+# Unified live price with cache
+# -----------------------------
+def get_live_price(ticker: str) -> Tuple[Optional[float], str]:
+    t = normalize_ticker(ticker)
+    now = time.time()
+    cached = price_cache.get(t)
+    if cached and (now - cached["timestamp"] < CACHE_TTL_SECONDS):
+        return cached["price"], cached["source"]
 
-def get_current_price(ticker):
-    """Get current price"""
-    return get_live_price(ticker)
+    for func in (fetch_price_yfinance, fetch_price_egxpy, fetch_price_mubasher):
+        price, source = func(t)
+        if price is not None:
+            price_cache[t] = {"price": price, "source": source, "timestamp": now}
+            return price, source
 
-def generate_realistic_stock_data(ticker, days=365):
-    """Generate historical data"""
-    current_price = get_live_price(ticker)
-    
-    dates = pd.date_range(end=datetime.now(), periods=days, freq='D')
-    seed = hash(ticker + dates[0].strftime('%Y%m%d')) % 100000
-    np.random.seed(seed)
-    
-    returns = np.random.normal(0.0001, 0.015, days)
-    cumulative_return = (1 + returns).cumprod()
-    starting_price = current_price / cumulative_return[-1]
-    
-    price_series = pd.Series(starting_price * cumulative_return, index=dates)
-    price_series.iloc[-1] = current_price
-    
-    high = price_series * (1 + np.abs(np.random.normal(0, 0.008, days)))
-    low = price_series * (1 - np.abs(np.random.normal(0, 0.008, days)))
-    volume = np.random.randint(500000, 8000000, days)
-    
-    df = pd.DataFrame({
-        'Open': price_series * (1 + np.random.normal(0, 0.003, days)),
-        'High': high,
-        'Low': low,
-        'Close': price_series,
-        'Volume': volume
-    }, index=dates)
-    
+    fb = BASE_PRICES.get(t)
+    if fb is not None:
+        price_cache[t] = {"price": fb, "source": "fallback", "timestamp": now}
+        return fb, "fallback"
+
+    return None, "not found"
+
+# -----------------------------
+# Historical data for indicators
+# -----------------------------
+def get_historical_df(ticker: str) -> pd.DataFrame:
+    df = fetch_history_yfinance(ticker, days=DEFAULT_HISTORY_DAYS)
+    if df is None:
+        df = fetch_history_egxpy(ticker, start="2025-01-01")
+    if df is not None and not df.empty:
+        if "close" not in df.columns and "Close" in df.columns:
+            df = df.rename(columns={"Close": "close"})
+        return df[["close"]].dropna()
+
+    price, _ = get_live_price(ticker)
+    if price is None:
+        price = BASE_PRICES.get(normalize_ticker(ticker), 10.0)
+    return generate_realistic_stock_data(price, points=SYNTHETIC_POINTS)
+
+def generate_realistic_stock_data(price: float, points: int = SYNTHETIC_POINTS) -> pd.DataFrame:
+    np.random.seed(42)
+    pct_changes = np.random.normal(0, 0.012, points)
+    values = [price]
+    for pct in pct_changes:
+        values.append(values[-1] * (1 + pct))
+    idx = pd.date_range(end=pd.Timestamp.utcnow(), periods=points + 1)
+    df = pd.DataFrame({"close": values[1:]}, index=idx[1:])
     return df
 
-def calculate_technical_indicators(data):
-    """Calculate technical indicators"""
-    current_price = float(data['Close'].iloc[-1])
-    prev_close = float(data['Close'].iloc[-2])
-    daily_change = ((current_price - prev_close) / prev_close) * 100
-    
-    # Moving Averages
-    ma_20 = float(data['Close'].tail(20).mean()) if len(data) >= 20 else None
-    ma_50 = float(data['Close'].tail(50).mean()) if len(data) >= 50 else None
-    ma_200 = float(data['Close'].tail(200).mean()) if len(data) >= 200 else None
-    
-    # RSI
-    delta = data['Close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-    loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
-    rs = gain / loss
-    rsi_value = rs.iloc[-1]
-    rsi = float(100 - (100 / (1 + rsi_value))) if rsi_value > 0 and not pd.isna(rsi_value) else 50.0
-    
-    # MACD
-    ema_12 = data['Close'].ewm(span=12, adjust=False).mean()
-    ema_26 = data['Close'].ewm(span=26, adjust=False).mean()
-    macd = float(ema_12.iloc[-1] - ema_26.iloc[-1])
-    signal_line = float((ema_12 - ema_26).ewm(span=9, adjust=False).mean().iloc[-1])
-    
-    # Trend
-    trend = 'Bullish' if ma_50 and current_price > ma_50 else 'Bearish' if ma_50 else 'Neutral'
-    
-    # Recommendation
-    signals = []
-    if rsi < 30:
-        signals.append('oversold')
-    if rsi > 70:
-        signals.append('overbought')
-    if macd > signal_line:
-        signals.append('bullish_macd')
-    if trend == 'Bullish':
-        signals.append('bullish_trend')
-    
-    if 'oversold' in signals or (len(signals) >= 2 and 'bullish_macd' in signals and 'bullish_trend' in signals):
-        recommendation = 'BUY'
-    elif 'overbought' in signals:
-        recommendation = 'SELL'
+# -----------------------------
+# Technical indicators
+# -----------------------------
+def compute_rsi(series: pd.Series, period: int = 14) -> Dict:
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
+    rs = gain / (loss.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    value = float(rsi.iloc[-1])
+    signal = "Overbought" if value > 70 else "Oversold" if value < 30 else "Neutral"
+    return {"value": round(value, 2), "signal": signal}
+
+def compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[float, float, float, str]:
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    macd_value = float(macd_line.iloc[-1])
+    signal_value = float(signal_line.iloc[-1])
+    hist_value = float(hist.iloc[-1])
+    signal_text = "Bullish" if macd_value > signal_value else "Bearish"
+    return macd_value, signal_value, hist_value, signal_text
+
+def calculate_technical_indicators(df: pd.DataFrame) -> Dict:
+    close = df["close"]
+    rsi = compute_rsi(close)
+    macd_value, macd_signal, macd_hist, macd_text = compute_macd(close)
+    ma20 = float(close.rolling(20).mean().iloc[-1]) if len(close) >= 20 else None
+    ma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None
+    ma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
+
+    last = float(close.iloc[-1])
+    trend = "Neutral"
+    if ma50 and ma200:
+        if last > ma50 and last > ma200:
+            trend = "Bullish"
+        elif last < ma50 and last < ma200:
+            trend = "Bearish"
+
+    if rsi["signal"] == "Oversold" and macd_value > macd_signal and trend == "Bullish":
+        action = "BUY"
+    elif rsi["signal"] == "Overbought" and macd_value < macd_signal and trend == "Bearish":
+        action = "SELL"
     else:
-        recommendation = 'HOLD'
-    
+        action = "HOLD"
+
     return {
-        'current_price': current_price,
-        'daily_change': daily_change,
-        'ma_20': ma_20,
-        'ma_50': ma_50,
-        'ma_200': ma_200,
-        'rsi': rsi,
-        'macd': macd,
-        'signal_line': signal_line,
-        'trend': trend,
-        'recommendation': recommendation
-    }
-
-# ==================== API ENDPOINTS ====================
-
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({
-        'message': '🚀 Egyptian Stock Analyzer API',
-        'status': 'healthy',
-        'version': '6.0 - Multi-Source Production',
-        'total_stocks': len(STOCK_BASE_DATA),
-        'data_sources': {
-            'primary': 'Yahoo Finance (yfinance with .CA suffix)',
-            'secondary': 'EGXPY (EGX specialist library)',
-            'tertiary': 'Mubasher (Web scraping)',
-            'fallback': 'Base prices'
+        "rsi": rsi,
+        "macd": {
+            "value": round(macd_value, 4),
+            "signal": round(macd_signal, 4),
+            "histogram": round(macd_hist, 4),
+            "signal_text": macd_text,
         },
-        'cache_duration': f'{CACHE_DURATION}s',
-        'methods': ['yfinance', 'egxpy', 'scraping'],
-        'endpoints': {
-            '/': 'API Info',
-            '/health': 'Health check',
-            '/api/stock/<ticker>': 'Stock analysis',
-            '/api/prices': 'All prices',
-            '/api/refresh/<ticker>': 'Refresh price',
-            '/api/test-sources/<ticker>': 'Test all data sources'
-        }
-    })
-
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'uptime': 'running',
-        'stocks_loaded': len(STOCK_BASE_DATA),
-        'cache_size': len(price_cache),
-        'version': '6.0'
-    }), 200
-
-@app.route('/api/test-sources/<ticker>', methods=['GET'])
-def test_sources(ticker):
-    """Test all data sources for a ticker"""
-    ticker = ticker.upper()
-    
-    if ticker not in STOCK_BASE_DATA:
-        return jsonify({'success': False, 'error': f'Ticker {ticker} not found'}), 404
-    
-    results = {}
-    
-    # Test yfinance
-    print(f"\n🧪 Testing yfinance for {ticker}...")
-    yf_result = get_price_yfinance(ticker)
-    results['yfinance'] = yf_result if yf_result else {'status': 'failed'}
-    
-    # Test egxpy
-    print(f"\n🧪 Testing egxpy for {ticker}...")
-    egxpy_result = get_price_egxpy(ticker)
-    results['egxpy'] = egxpy_result if egxpy_result else {'status': 'failed'}
-    
-    # Test Mubasher scraping
-    print(f"\n🧪 Testing Mubasher scraping for {ticker}...")
-    mubasher_result = get_price_mubasher(ticker)
-    results['mubasher'] = mubasher_result if mubasher_result else {'status': 'failed'}
-    
-    # Base price
-    results['base_price'] = {
-        'price': STOCK_BASE_DATA[ticker]['base_price'],
-        'source': 'Fallback',
-        'method': 'hardcoded'
+        "moving_averages": {
+            "ma_20": round(ma20, 4) if ma20 else None,
+            "ma_50": round(ma50, 4) if ma50 else None,
+            "ma_200": round(ma200, 4) if ma200 else None,
+            "trend": trend,
+        },
+        "recommendation": {"action": action},
     }
-    
-    return jsonify({
-        'success': True,
-        'ticker': ticker,
-        'name': STOCK_BASE_DATA[ticker]['name'],
-        'test_results': results,
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    })
 
-@app.route('/api/stock/<ticker>', methods=['GET'])
-def analyze_stock(ticker):
-    """Full stock analysis"""
-    try:
-        ticker = ticker.upper()
-        
-        if ticker not in STOCK_BASE_DATA:
-            return jsonify({
-                'success': False,
-                'error': f'Ticker {ticker} not found'
-            }), 404
-        
-        days = int(request.args.get('days', 365))
-        data = generate_realistic_stock_data(ticker, days)
-        indicators = calculate_technical_indicators(data)
-        stock_info = STOCK_BASE_DATA[ticker]
-        
-        return jsonify({
-            'success': True,
-            'ticker': ticker,
-            'name': stock_info['name'],
-            'sector': stock_info['sector'],
-            'price_source': price_source.get(ticker, 'Not fetched yet'),
-            'price_data': {
-                'current_price': round(indicators['current_price'], 2),
-                'daily_change_percent': round(indicators['daily_change'], 2),
-            },
-            'technical_indicators': {
-                'rsi': {'value': round(indicators['rsi'], 2)},
-                'macd': {'signal_text': 'Bullish' if indicators['macd'] > indicators['signal_line'] else 'Bearish'},
-                'moving_averages': {'trend': indicators['trend']}
-            },
-            'recommendation': {'action': indicators['recommendation']}
+# -----------------------------
+# FastAPI app and endpoints
+# -----------------------------
+app = FastAPI(title="EGX Multi-Source API", version="1.1.0")
+
+# Optional CORS for external clients (n8n/Telegram handlers)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+@app.get("/api/stock/{ticker}")
+def get_stock(ticker: str):
+    t = normalize_ticker(ticker)
+    price, source = get_live_price(t)
+    if price is None:
+        raise HTTPException(status_code=404, detail="Ticker not found or price unavailable")
+
+    df = get_historical_df(t)
+    indicators = calculate_technical_indicators(df)
+
+    daily_change_percent = None
+    if df is not None and len(df) >= 2:
+        last = float(df["close"].iloc[-1])
+        prev = float(df["close"].iloc[-2])
+        if prev != 0:
+            daily_change_percent = round(((last - prev) / prev) * 100, 2)
+
+    meta = SYMBOL_META.get(t, {"name": t, "sector": "EGX"})
+    return {
+        "ticker": t,
+        "name": meta["name"],
+        "sector": meta["sector"],
+        "price_data": {
+            "current_price": round(float(price), 4),
+            "daily_change_percent": daily_change_percent,
+            "price_source": source,
+        },
+        "technical_indicators": indicators,
+    }
+
+@app.get("/api/prices")
+def get_prices():
+    results = []
+    tickers = sorted(set(list(SYMBOL_META.keys()) + list(TICKER_MAP.keys())))
+    for t in tickers:
+        price, source = get_live_price(t)
+        meta = SYMBOL_META.get(t, {"name": t, "sector": "EGX"})
+        results.append({
+            "ticker": t,
+            "name": meta["name"],
+            "sector": meta["sector"],
+            "price": round(float(price), 4) if price is not None else None,
+            "source": source,
         })
-        
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+    return results
 
-@app.route('/api/prices', methods=['GET'])
-def current_prices():
-    """Get all current prices"""
-    prices = {}
-    
-    for ticker in list(STOCK_BASE_DATA.keys())[:5]:  # Test مع 5 أسهم فقط
-        current = get_current_price(ticker)
-        prices[ticker] = {
-            'name': STOCK_BASE_DATA[ticker]['name'],
-            'price': round(current, 2),
-            'source': price_source.get(ticker, 'Not fetched')
+@app.get("/api/test-sources/{ticker}")
+def test_sources(ticker: str):
+    t = normalize_ticker(ticker)
+    out = {}
+    for name, func in [
+        ("yfinance", fetch_price_yfinance),
+        ("egxpy", fetch_price_egxpy),
+        ("mubasher", fetch_price_mubasher),
+    ]:
+        price, source = func(t)
+        out[name] = {
+            "price": round(float(price), 4) if price is not None else None,
+            "status": "success" if price is not None else "failed",
+            "source": source,
         }
-    
-    return jsonify({
-        'success': True,
-        'total': len(prices),
-        'prices': prices
-    })
+    return out
 
-@app.route('/api/refresh/<ticker>', methods=['GET'])
-def refresh_price(ticker):
-    """Force refresh price"""
-    ticker = ticker.upper()
-    
-    if ticker not in STOCK_BASE_DATA:
-        return jsonify({'success': False, 'error': 'Ticker not found'}), 404
-    
-    # Clear cache
-    if ticker in price_cache:
-        del price_cache[ticker]
-    if ticker in cache_timestamp:
-        del cache_timestamp[ticker]
-    
-    new_price = get_live_price(ticker)
-    
-    return jsonify({
-        'success': True,
-        'ticker': ticker,
-        'price': round(new_price, 2),
-        'source': price_source.get(ticker, 'Unknown'),
-        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    })
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "cache_entries": len(price_cache),
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+    }
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    print("=" * 80)
-    print("🚀 Egyptian Stock Analyzer API v6.0 - Multi-Source Production")
-    print("=" * 80)
-    print(f"📊 Stocks: {len(STOCK_BASE_DATA)}")
-    print(f"🔄 Data Sources: yfinance → egxpy → Mubasher Scraping → Base Prices")
-    print(f"⏱️  Cache: {CACHE_DURATION}s")
-    print(f"🌐 Port: {port}")
-    print("=" * 80)
-    app.run(host='0.0.0.0', port=port, debug=False)
+# Local run:
+# uvicorn app:app --host 0.0.0.0 --port 8000
